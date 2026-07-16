@@ -1,0 +1,23 @@
+{
+  "database_path": "data/personal_brain.sqlite3",
+  "memory_dir": "memory",
+  "brain_index_path": "brain_index.json",
+  "default_source": "cli",
+  "chat_model": {
+    "provider": "openai_compatible",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "model": "gpt-4.1-mini",
+    "enabled": false,
+    "timeout_seconds": 60
+  },
+  "embedding_model": {
+    "provider": "openai_compatible",
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "model": "text-embedding-3-small",
+    "enabled": false,
+    "timeout_seconds": 60,
+    "dimension": null
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "synthetic": true,
+  "provenance": "Created from scratch for the public portfolio demo; not derived from real user data.",
+  "scenarios": ["preference", "project decision", "temporary task", "technical viewpoint", "superseded decision", "no-answer query"],
+  "memories": [
+    {
+      "memory_id": 101,
+      "raw_message_id": 501,
+      "title": "Greenhouse notification policy",
+      "content": "The Aurora greenhouse team decided to send one daily digest instead of immediate sensor alerts.",
+      "raw_content": "For Aurora, let's use a daily digest. Immediate alerts are too noisy unless temperature is critical.",
+      "category": "project decision",
+      "topics": ["Aurora", "notifications", "greenhouse"]
+    },
+    {
+      "memory_id": 102,
+      "raw_message_id": 502,
+      "title": "Critical temperature exception",
+      "content": "Critical greenhouse temperature events should bypass the daily digest and trigger an immediate alert.",
+      "raw_content": "Critical temperature should still notify immediately; that is the exception to the digest rule.",
+      "category": "project decision",
+      "topics": ["Aurora", "temperature", "alerts"]
+    },
+    {
+      "memory_id": 103,
+      "raw_message_id": 503,
+      "title": "Irrigation review",
+      "content": "The team plans to review irrigation calibration next Friday.",
+      "raw_content": "Next Friday we should review whether the irrigation calibration is still accurate.",
+      "category": "temporary task",
+      "topics": ["Aurora", "irrigation", "review"]
+    },
+    {
+      "memory_id": 104,
+      "raw_message_id": 504,
+      "title": "Preferred report format",
+      "content": "The fictional operator prefers concise daily summaries with evidence links.",
+      "raw_content": "Please keep the daily summary concise and attach an evidence link to each decision.",
+      "category": "preference",
+      "topics": ["reports", "evidence", "format"]
+    },
+    {
+      "memory_id": 105,
+      "raw_message_id": 505,
+      "title": "Offline-first technical choice",
+      "content": "The demo architecture keeps source records local and treats cloud model calls as optional adapters.",
+      "raw_content": "Let's keep source records local; cloud model calls should remain optional adapters.",
+      "category": "technical viewpoint",
+      "topics": ["architecture", "local-first", "privacy"]
+    },
+    {
+      "memory_id": 106,
+      "raw_message_id": 506,
+      "title": "Superseded alert policy",
+      "content": "An early Aurora proposal recommended immediate alerts for every sensor change, but this proposal was superseded by the daily digest policy.",
+      "raw_content": "Early idea: alert on every sensor change. Later decision: replace this with a daily digest except for critical temperature.",
+      "category": "superseded decision",
+      "topics": ["Aurora", "alerts", "superseded"]
+    }
+  ]
+}

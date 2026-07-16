@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install verified Gitleaks
+        shell: pwsh
+        run: |
+          $version = "8.30.1"
+          $expected = "d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e"
+          $zip = Join-Path $env:RUNNER_TEMP "gitleaks.zip"
+          $bin = Join-Path $env:RUNNER_TEMP "gitleaks"
+          Invoke-WebRequest "https://github.com/gitleaks/gitleaks/releases/download/v$version/gitleaks_${version}_windows_x64.zip" -OutFile $zip
+          $actual = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw "Gitleaks checksum mismatch" }
+          Expand-Archive $zip -DestinationPath $bin
+          Add-Content $env:GITHUB_PATH $bin
+      - name: Scan repository history for secrets
+        shell: pwsh
+        run: gitleaks git . --log-opts="--all --full-history" --redact=100 --no-banner
+      - name: Compile source
+        shell: pwsh
+        run: python -c "from pathlib import Path; files=list(Path('.').rglob('*.py')); [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in files]; print(f'compiled {len(files)} files')"
+      - name: Run tests
+        run: python -m unittest discover -v
+      - name: Reject private paths
+        run: python scripts/security/check_public_paths.py
+      - name: Run offline demo
+        run: python demo/offline_demo.py
