@@ -17,7 +17,7 @@ from personal_brain.brain import PersonalBrain
 from personal_brain.config import BrainConfig, ChatModelConfig, EmbeddingModelConfig
 from personal_brain.extractor import MemoryExtractor, preserve_exact_technical_tokens
 from personal_brain.schema import BrainSchema, ClosingConnection
-from scripts.adapters.feishu_bridge import FeishuBrainBridge
+from scripts.adapters.feishu_bridge import FeishuBrainBridge, safe_log
 from tests.reliability.test_reliability import FakeClient, config_for, options, payload
 
 
@@ -41,6 +41,14 @@ class CountingChat:
         if self.block:
             self.release.wait(5)
         return self.response
+
+
+class SafeLogTests(unittest.TestCase):
+    def test_non_ascii_log_survives_ascii_console(self):
+        raw = io.BytesIO()
+        stream = io.TextIOWrapper(raw, encoding="ascii", write_through=True)
+        safe_log("已成功发送", stream=stream)
+        self.assertIn(b"\\u5df2", raw.getvalue())
 
 
 class ReadOnlyEmbedding:

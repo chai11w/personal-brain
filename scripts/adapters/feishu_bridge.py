@@ -28,6 +28,24 @@ from personal_brain.memory_view import MemoryDetail  # noqa: E402
 FEISHU_OPEN_API = "https://open.feishu.cn/open-apis"
 
 
+def safe_log(message: str, *, stream: Any = None) -> None:
+    """Write diagnostics without allowing console encoding to affect delivery state."""
+    target = sys.stdout if stream is None else stream
+    try:
+        print(message, file=target, flush=True)
+    except UnicodeEncodeError:
+        try:
+            encoding = getattr(target, "encoding", None) or "ascii"
+            escaped = message.encode(encoding, errors="backslashreplace").decode(
+                encoding, errors="replace"
+            )
+            print(escaped, file=target, flush=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 @dataclass(frozen=True)
 class FeishuOptions:
     mode: str
@@ -158,10 +176,7 @@ class FeishuBrainBridge:
             age_seconds = int(time.time() - message_created_at) if message_created_at else None
             note = f"stale Feishu message ignored; age_seconds={age_seconds}; no reply sent"
             self.brain.mark_interaction_ignored(interaction_id, action="stale_ignored", note=note)
-            print(
-                f"ignored stale Feishu message_id={message_id} age_seconds={age_seconds}",
-                flush=True,
-            )
+            safe_log(f"ignored stale Feishu message_id={message_id} age_seconds={age_seconds}")
             return {"ok": True, "ignored": "stale-message", "message_id": message_id}
 
         self._mark_working_async(message_id)
@@ -198,7 +213,7 @@ class FeishuBrainBridge:
         self._worker.join(timeout=max(0.1, timeout))
 
     def _process_and_reply(self, interaction_id: int, message_id: str, text: str, sender: str, delivery_only: bool = False) -> None:
-        print(f"received from {sender}: {text}", flush=True)
+        safe_log(f"received from {sender}: {text}")
         if delivery_only:
             item = self.brain.get_interaction(interaction_id)
             self._deliver(interaction_id, message_id, str(item["reply_text"]))
@@ -229,17 +244,17 @@ class FeishuBrainBridge:
 
     def _deliver(self, interaction_id: int, message_id: str, reply: str) -> None:
         if self.options.dry_run:
-            print(f"dry-run reply to {message_id}: {reply}", flush=True)
+            safe_log(f"dry-run reply to {message_id}: {reply}")
             self.brain.mark_interaction_delivery(interaction_id, succeeded=False, dry_run=True)
             return
 
         try:
             self.client.reply_text(message_id, reply)
             self.brain.mark_interaction_delivery(interaction_id, succeeded=True)
-            print(f"replied to {message_id}: {reply}", flush=True)
+            safe_log(f"replied to {message_id}: {reply}")
         except Exception as exc:
             self.brain.mark_interaction_delivery(interaction_id, succeeded=False, error=str(exc))
-            print(f"failed to reply {message_id}: {exc}", file=sys.stderr, flush=True)
+            safe_log(f"failed to reply {message_id}: {exc}", stream=sys.stderr)
 
     def _reply_for_text(self, text: str, sender: str, message_id: str | None = None) -> BridgeReply:
         if is_help_command(text):
@@ -301,9 +316,9 @@ class FeishuBrainBridge:
             return
         try:
             self.client.add_reaction(message_id, emoji_type)
-            print(f"reacted to {message_id}: {emoji_type}", flush=True)
+            safe_log(f"reacted to {message_id}: {emoji_type}")
         except Exception as exc:
-            print(f"failed to react {message_id}: {exc}", file=sys.stderr, flush=True)
+            safe_log(f"failed to react {message_id}: {exc}", stream=sys.stderr)
 
     def _remember_text(self, text: str, sender: str, message_id: str | None = None) -> BridgeReply:
         result = self.brain.ingest(
@@ -360,7 +375,7 @@ class FeishuBrainBridge:
                 latency_ms=latency_ms,
             )
         except Exception as exc:
-            print(f"failed to record interaction log {message_id}: {exc}", file=sys.stderr, flush=True)
+            safe_log(f"failed to record interaction log {message_id}: {exc}", stream=sys.stderr)
 
     def _record_stale_interaction(
         self,
@@ -390,7 +405,7 @@ class FeishuBrainBridge:
                 latency_ms=0,
             )
         except Exception as exc:
-            print(f"failed to record stale interaction log {message_id}: {exc}", file=sys.stderr, flush=True)
+            safe_log(f"failed to record stale interaction log {message_id}: {exc}", stream=sys.stderr)
 
     def _valid_token(self, payload: dict[str, Any]) -> bool:
         expected = self.options.verification_token
@@ -489,8 +504,8 @@ def main(argv: list[str] | None = None) -> int:
     bridge = FeishuBrainBridge(brain=brain, client=client, options=options)
     FeishuHandler.bridge = bridge
     server = ThreadingHTTPServer((args.host, args.port), FeishuHandler)
-    print(f"Feishu bridge listening on http://{args.host}:{args.port}/feishu/events", flush=True)
-    print(f"mode={args.mode} ask_prefix={args.ask_prefix!r} dry_run={args.dry_run}", flush=True)
+    safe_log(f"Feishu bridge listening on http://{args.host}:{args.port}/feishu/events")
+    safe_log(f"mode={args.mode} ask_prefix={args.ask_prefix!r} dry_run={args.dry_run}")
     try:
         server.serve_forever()
     finally:
