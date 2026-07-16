@@ -29,8 +29,7 @@ class MemoryOperations:
         if memory_id <= 0:
             raise ValueError("memory_id must be positive")
 
-        self.schema.initialize()
-        with self.schema.connect() as conn:
+        with self.schema.connect_write() as conn:
             row = conn.execute(
                 """
                 SELECT id, raw_message_id, title, content, status

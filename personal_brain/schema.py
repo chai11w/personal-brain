@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+
+class ClosingConnection(sqlite3.Connection):
+    """sqlite context manager that also releases the file handle on exit."""
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 @dataclass(frozen=True)
@@ -26,19 +37,74 @@ class BrainSchema:
 
     def __init__(self, database_path: Path):
         self.database_path = database_path
-        self.database_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.database_path)
+    def connect_write(self) -> sqlite3.Connection:
+        if not self.database_path.exists():
+            raise FileNotFoundError(f"database does not exist; run init-db first: {self.database_path}")
+        conn = sqlite3.connect(self.database_path, factory=ClosingConnection)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=MEMORY")
         conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA synchronous=FULL")
+        try:
+            self.require_current_schema(conn)
+        except Exception:
+            conn.close()
+            raise
         return conn
 
-    def initialize(self) -> SchemaInitResult:
+    def connect_readonly(self) -> sqlite3.Connection:
+        if not self.database_path.exists():
+            raise FileNotFoundError(f"database does not exist; run init-db first: {self.database_path}")
+        wal_path = Path(str(self.database_path) + "-wal")
+        # A checkpointed database can be opened immutable to guarantee that a
+        # read command does not create WAL/SHM sidecars. If an active WAL exists,
+        # use normal read-only mode so committed WAL frames remain visible.
+        suffix = "mode=ro" if wal_path.exists() else "mode=ro&immutable=1"
+        uri = f"{self.database_path.resolve().as_uri()}?{suffix}"
+        conn = sqlite3.connect(uri, uri=True, factory=ClosingConnection)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA query_only=ON")
+        self.require_current_schema(conn)
+        return conn
+
+    # Compatibility wrapper for write paths. New code should state its intent.
+    def connect(self) -> sqlite3.Connection:
+        return self.connect_write()
+
+    def initialize(self, *, fail_at: str | None = None) -> SchemaInitResult:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
         warnings: list[str] = []
         migrated_legacy = False
-        with self.connect() as conn:
+        existed = self.database_path.exists()
+        current = 0
+        if existed:
+            with sqlite3.connect(self.database_path, factory=ClosingConnection) as probe:
+                integrity = probe.execute("PRAGMA integrity_check").fetchone()[0]
+                if integrity != "ok":
+                    raise RuntimeError(f"database integrity check failed: {integrity}")
+                current = self._current_version(probe)
+            if current < SCHEMA_VERSION:
+                backup_path = self._verified_backup()
+                warnings.append(f"Verified pre-migration backup: {backup_path}")
+
+        conn = sqlite3.connect(self.database_path)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        mode = str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+        if mode != "wal":
+            conn.close()
+            raise RuntimeError(f"failed to enable WAL journal mode: {mode}")
+        conn.execute("PRAGMA synchronous=FULL")
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            legacy_interaction_max_id = None
+            if current < SCHEMA_VERSION and self._table_exists(conn, "interaction_logs"):
+                row = conn.execute("SELECT MAX(id) FROM interaction_logs").fetchone()
+                legacy_interaction_max_id = int(row[0]) if row and row[0] is not None else None
             migrated_legacy = self._move_legacy_memories(conn)
             if migrated_legacy:
                 warnings.append(
@@ -46,8 +112,21 @@ class BrainSchema:
                     "Those rows are raw evidence, not AI atomic memories."
                 )
             self._create_schema(conn)
+            if legacy_interaction_max_id is not None:
+                self._migrate_legacy_interactions(conn, legacy_interaction_max_id)
+            if fail_at == "after_additive_migration":
+                raise RuntimeError("injected migration failure after additive migration")
             self._record_schema_version(conn)
             tables = self.table_counts(conn)
+            conn.commit()
+            fk_errors = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if fk_errors:
+                raise RuntimeError(f"foreign key check failed: {len(fk_errors)} violation(s)")
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
         return SchemaInitResult(
             database_path=self.database_path,
             schema_version=SCHEMA_VERSION,
@@ -57,8 +136,45 @@ class BrainSchema:
         )
 
     def stats(self) -> dict[str, int]:
-        with self.connect() as conn:
+        with self.connect_readonly() as conn:
             return self.table_counts(conn)
+
+    def require_current_schema(self, conn: sqlite3.Connection) -> None:
+        version = self._current_version(conn)
+        if version != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema version {version} is not supported; run init-db for version {SCHEMA_VERSION}"
+            )
+
+    def _verified_backup(self) -> Path:
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_path = self.database_path.with_name(f"{self.database_path.name}.pre-v{SCHEMA_VERSION}-{stamp}.bak")
+        source = sqlite3.connect(self.database_path)
+        target = sqlite3.connect(backup_path)
+        try:
+            source.backup(target)
+            target.commit()
+            result = target.execute("PRAGMA integrity_check").fetchone()[0]
+            if result != "ok":
+                raise RuntimeError(f"backup integrity check failed: {result}")
+        except Exception:
+            target.close()
+            source.close()
+            backup_path.unlink(missing_ok=True)
+            raise
+        target.close()
+        source.close()
+        return backup_path
+
+    @staticmethod
+    def _current_version(conn: sqlite3.Connection) -> int:
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations'"
+        ).fetchone()
+        if not exists:
+            return 0
+        row = conn.execute("SELECT MAX(version) FROM schema_migrations").fetchone()
+        return int(row[0] or 0)
 
     def table_counts(self, conn: sqlite3.Connection) -> dict[str, int]:
         tables = [
@@ -92,7 +208,7 @@ class BrainSchema:
         return True
 
     def _create_schema(self, conn: sqlite3.Connection) -> None:
-        conn.executescript(
+        self._execute_script(conn,
             """
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
@@ -107,7 +223,11 @@ class BrainSchema:
                 created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                 metadata_json TEXT,
                 processed_status TEXT NOT NULL DEFAULT 'pending',
-                processed_at TEXT
+                processed_at TEXT,
+                source_message_id TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                processing_started_at TEXT,
+                last_error TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_raw_messages_created_at
@@ -131,6 +251,12 @@ class BrainSchema:
                 error TEXT,
                 latency_ms INTEGER,
                 created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                idempotency_key TEXT,
+                processing_status TEXT NOT NULL DEFAULT 'legacy_terminal',
+                delivery_status TEXT NOT NULL DEFAULT 'unknown',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                delivered_at TEXT,
                 FOREIGN KEY (raw_message_id) REFERENCES raw_messages(id)
             );
 
@@ -260,12 +386,78 @@ class BrainSchema:
             ON memories(memory_category)
             """
         )
+        self._add_column(conn, "raw_messages", "source_message_id TEXT")
+        self._add_column(conn, "raw_messages", "attempt_count INTEGER NOT NULL DEFAULT 0")
+        self._add_column(conn, "raw_messages", "processing_started_at TEXT")
+        self._add_column(conn, "raw_messages", "last_error TEXT")
+        self._add_column(conn, "interaction_logs", "idempotency_key TEXT")
+        self._add_column(conn, "interaction_logs", "processing_status TEXT NOT NULL DEFAULT 'legacy_terminal'")
+        self._add_column(conn, "interaction_logs", "delivery_status TEXT NOT NULL DEFAULT 'unknown'")
+        self._add_column(conn, "interaction_logs", "attempt_count INTEGER NOT NULL DEFAULT 0")
+        self._add_column(conn, "interaction_logs", "updated_at TEXT")
+        self._add_column(conn, "interaction_logs", "delivered_at TEXT")
+        conn.execute("UPDATE interaction_logs SET updated_at = COALESCE(updated_at, created_at)")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_messages_source_message "
+            "ON raw_messages(source, source_message_id) WHERE source_message_id IS NOT NULL"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_interaction_logs_idempotency "
+            "ON interaction_logs(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
 
     def _record_schema_version(self, conn: sqlite3.Connection) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO schema_migrations(version) VALUES (?)",
             (SCHEMA_VERSION,),
         )
+
+    def _add_column(self, conn: sqlite3.Connection, table: str, definition: str) -> None:
+        name = definition.split()[0]
+        if not self._has_column(conn, table, name):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+    def _migrate_legacy_interactions(self, conn: sqlite3.Connection, max_id: int) -> None:
+        conn.execute(
+            """
+            UPDATE interaction_logs SET
+                processing_status = CASE
+                    WHEN action='stale_ignored' THEN 'ignored'
+                    WHEN status='succeeded' THEN 'succeeded'
+                    WHEN status='failed' THEN 'failed'
+                    ELSE 'legacy_terminal'
+                END,
+                delivery_status = CASE WHEN action='stale_ignored' THEN 'not_required' ELSE 'unknown' END,
+                status = CASE
+                    WHEN action='stale_ignored' THEN 'ignored'
+                    WHEN status IS NULL THEN 'legacy_unknown'
+                    ELSE status
+                END,
+                idempotency_key=NULL, attempt_count=0, delivered_at=NULL,
+                updated_at=COALESCE(updated_at, created_at)
+            WHERE id <= ?
+            """,
+            (max_id,),
+        )
+        unsafe = conn.execute(
+            """
+            SELECT COUNT(*) FROM interaction_logs
+            WHERE id <= ? AND (processing_status IN ('pending','processing') OR idempotency_key IS NOT NULL)
+            """,
+            (max_id,),
+        ).fetchone()[0]
+        if unsafe:
+            raise RuntimeError(f"legacy interaction migration left {unsafe} recoverable row(s)")
+
+    @staticmethod
+    def _execute_script(conn: sqlite3.Connection, script: str) -> None:
+        # This schema contains no triggers or semicolons inside literals. Running
+        # statements individually preserves the caller's explicit transaction;
+        # sqlite3.executescript would issue an implicit COMMIT first.
+        for statement in script.split(";"):
+            sql = statement.strip()
+            if sql:
+                conn.execute(sql)
 
     @staticmethod
     def _table_exists(conn: sqlite3.Connection, table: str) -> bool:

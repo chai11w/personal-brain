@@ -53,7 +53,6 @@ class SemanticMemory:
         self.embedding_config = embedding_config
 
     def embed_missing_memories(self, limit: int = 100) -> EmbedMemoriesResult:
-        self.schema.initialize()
         if not self.embedding_client.available:
             return EmbedMemoriesResult(
                 embedded_count=0,
@@ -61,7 +60,7 @@ class SemanticMemory:
                 warning=f"embedding model unavailable; set {self.embedding_config.api_key_env}",
             )
 
-        with self.schema.connect() as conn:
+        with self.schema.connect_write() as conn:
             rows = conn.execute(
                 """
                 SELECT m.id, m.title, m.content, m.memory_category, m.memory_type
@@ -92,7 +91,6 @@ class SemanticMemory:
         if not ids:
             return EmbedMemoriesResult(embedded_count=0, skipped_count=0)
 
-        self.schema.initialize()
         if not self.embedding_client.available:
             return EmbedMemoriesResult(
                 embedded_count=0,
@@ -101,7 +99,7 @@ class SemanticMemory:
             )
 
         placeholders = ",".join("?" for _ in ids)
-        with self.schema.connect() as conn:
+        with self.schema.connect_write() as conn:
             rows = conn.execute(
                 f"""
                 SELECT m.id, m.title, m.content, m.memory_category, m.memory_type
@@ -131,7 +129,6 @@ class SemanticMemory:
         clean_query = query.strip()
         if not clean_query:
             raise ValueError("recall query cannot be empty")
-        self.schema.initialize()
         if not self.embedding_client.available:
             raise RuntimeError(f"embedding model unavailable; set {self.embedding_config.api_key_env}")
 
@@ -139,7 +136,7 @@ class SemanticMemory:
         if not query_vector:
             raise RuntimeError("embedding model returned empty query vector")
 
-        with self.schema.connect() as conn:
+        with self.schema.connect_readonly() as conn:
             rows = conn.execute(
                 """
                 SELECT
@@ -318,7 +315,7 @@ def same_day_todo_boost(query: str, row: sqlite3.Row) -> float:
     boost = 0.0
     if row["memory_category"] == "临时待办":
         boost += 0.24
-    if any(term in text for term in ("待办", "要做", "计划", "下一步", "准备", "别忘", "验证", "联系", "会议")):
+    if any(term in text for term in ("待办", "要做", "计划", "下一步", "准备", "别忘", "验证", "联系", "面试")):
         boost += 0.08
     if "今天" in query and "今天" in text:
         boost += 0.12

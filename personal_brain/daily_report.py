@@ -63,10 +63,9 @@ class DailyReportBuilder:
         title: str,
         window_label: str,
     ) -> DailyReportResult:
-        self.schema.initialize()
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.schema.connect() as conn:
+        with self.schema.connect_readonly() as conn:
             data = load_window_data(conn, start_at=start_at, end_at=end_at)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         markdown = format_daily_report(
             title=title,
             window_label=window_label,
@@ -183,7 +182,7 @@ def format_daily_report(
         f"# {title}",
         "",
         "用途：提取指定时间窗口内的记录，并用固定规则标记可能需要回看的链路问题；不调用 AI，不修改数据。",
-        "Reminder: review the current project documentation before interpreting this report.",
+        "提醒：未来 Codex 解读本报告前，应先阅读 .agents/project_memory.md。",
         "隐私：本报告可能包含用户原文，只应保留在本地。",
         "",
         "## 时间窗口",

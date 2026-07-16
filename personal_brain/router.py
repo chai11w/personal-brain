@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from .schema import ClosingConnection
 
 
 @dataclass(frozen=True)
@@ -32,8 +37,7 @@ class MemoryRouterBuilder:
         self.topics_path = memory_dir / "topics.json"
         self.manifest_path = memory_dir / "memory_manifest.json"
 
-    def build(self) -> RouterBuildResult:
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
+    def build(self, *, fail_at: str | None = None) -> RouterBuildResult:
         warnings: list[str] = []
 
         with self._connect() as conn:
@@ -45,6 +49,7 @@ class MemoryRouterBuilder:
                     "Database uses legacy memories table. Entries are routed as legacy_unprocessed, "
                     "not AI-extracted atomic memories."
                 )
+
             else:
                 topics = []
                 manifest = []
@@ -59,24 +64,62 @@ class MemoryRouterBuilder:
                     "not AI-extracted atomic memories."
                 )
 
-        self._write_json(self.topics_path, topics)
-        self._write_json(self.manifest_path, manifest)
-        brain_index = self._brain_index(topics, manifest, warnings)
-        self._write_json(self.brain_index_path, brain_index)
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+
+        generation_id = datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
+        generations_dir = self.memory_dir / "generations"
+        temp_dir = generations_dir / f".{generation_id}.tmp"
+        final_dir = generations_dir / generation_id
+        temp_dir.mkdir(parents=True, exist_ok=False)
+        topics_path = temp_dir / "topics.json"
+        manifest_path = temp_dir / "memory_manifest.json"
+        self._write_json(topics_path, {"generation_id": generation_id, "items": topics})
+        if fail_at == "after_first_file":
+            raise RuntimeError("injected router failure after first file")
+        self._write_json(manifest_path, {"generation_id": generation_id, "items": manifest})
+        checksums = {
+            "topics.json": self._sha256(topics_path),
+            "memory_manifest.json": self._sha256(manifest_path),
+        }
+        self._write_json(
+            temp_dir / "generation.json",
+            {"generation_id": generation_id, "checksums": checksums,
+             "topic_count": len(topics), "memory_count": len(manifest)},
+        )
+        if fail_at == "before_generation_rename":
+            raise RuntimeError("injected router failure before generation rename")
+        final_dir.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(temp_dir, final_dir)
+        if fail_at == "before_pointer_replace":
+            raise RuntimeError("injected router failure before pointer replace")
+        topics_path = final_dir / "topics.json"
+        manifest_path = final_dir / "memory_manifest.json"
+        brain_index = self._brain_index(
+            topics, manifest, warnings, generation_id, topics_path, manifest_path, checksums
+        )
+        pointer_tmp = self.brain_index_path.with_name(self.brain_index_path.name + ".tmp")
+        self._write_json(pointer_tmp, brain_index)
+        os.replace(pointer_tmp, self.brain_index_path)
 
         return RouterBuildResult(
             brain_index_path=self.brain_index_path,
-            topics_path=self.topics_path,
-            manifest_path=self.manifest_path,
+            topics_path=topics_path,
+            manifest_path=manifest_path,
             topic_count=len(topics),
             memory_count=len(manifest),
             warnings=warnings,
         )
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.database_path)
+        if not self.database_path.exists():
+            raise FileNotFoundError(f"database does not exist; run init-db first: {self.database_path}")
+        wal_path = Path(str(self.database_path) + "-wal")
+        suffix = "mode=ro" if wal_path.exists() else "mode=ro&immutable=1"
+        uri = f"{self.database_path.resolve().as_uri()}?{suffix}"
+        conn = sqlite3.connect(uri, uri=True, factory=ClosingConnection)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=MEMORY")
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     def _build_from_ai_native_schema(self, conn: sqlite3.Connection) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -257,17 +300,23 @@ class MemoryRouterBuilder:
         topics: list[dict[str, Any]],
         manifest: list[dict[str, Any]],
         warnings: list[str],
+        generation_id: str,
+        topics_path: Path,
+        manifest_path: Path,
+        checksums: dict[str, str],
     ) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": 2,
+            "generation_id": generation_id,
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "product": "AI-native Personal Brain",
             "purpose": "Lightweight routing index for Codex and other AI callers.",
             "entrypoints": {
-                "topics": self.topics_path.as_posix(),
-                "memory_manifest": self.manifest_path.as_posix(),
+                "topics": topics_path.as_posix(),
+                "memory_manifest": manifest_path.as_posix(),
                 "sqlite": self.database_path.as_posix(),
             },
+            "checksums": checksums,
             "stats": {
                 "topics": len(topics),
                 "manifest_memories": len(manifest),
@@ -297,7 +346,15 @@ class MemoryRouterBuilder:
     @staticmethod
     def _write_json(path: Path, payload: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        data = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        with path.open("wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
 
     @staticmethod
     def _shorten(text: str, limit: int) -> str:
@@ -318,3 +375,32 @@ class MemoryRouterBuilder:
     def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
         rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
         return any(row["name"] == column for row in rows)
+
+
+def load_router_bundle(brain_index_path: Path) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Load one committed generation and reject mixed/corrupt Router files."""
+    last_error: Exception | None = None
+    for _ in range(2):
+        try:
+            pointer = json.loads(brain_index_path.read_text(encoding="utf-8"))
+            generation_id = str(pointer["generation_id"])
+
+            def resolve(value: str) -> Path:
+                path = Path(value)
+                return path if path.is_absolute() else brain_index_path.parent / path
+
+            topics_path = resolve(pointer["entrypoints"]["topics"])
+            manifest_path = resolve(pointer["entrypoints"]["memory_manifest"])
+            expected = pointer["checksums"]
+            if hashlib.sha256(topics_path.read_bytes()).hexdigest() != expected["topics.json"]:
+                raise RuntimeError("Router topics checksum mismatch")
+            if hashlib.sha256(manifest_path.read_bytes()).hexdigest() != expected["memory_manifest.json"]:
+                raise RuntimeError("Router manifest checksum mismatch")
+            topics = json.loads(topics_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if topics.get("generation_id") != generation_id or manifest.get("generation_id") != generation_id:
+                raise RuntimeError("Router generation mismatch")
+            return pointer, topics, manifest
+        except (OSError, KeyError, ValueError, RuntimeError) as exc:
+            last_error = exc
+    raise RuntimeError(f"failed to load a consistent Router generation: {last_error}")

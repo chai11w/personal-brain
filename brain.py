@@ -36,6 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
     interaction_list_parser = subparsers.add_parser("interaction-list", help="list recent Feishu/adapter interactions")
     interaction_list_parser.add_argument("--limit", type=int, default=20, help="max interactions to show")
 
+    raw_reprocess_parser = subparsers.add_parser("raw-reprocess", help="retry one failed raw message")
+    raw_reprocess_parser.add_argument("raw_message_id", type=int)
+    raw_reprocess_parser.add_argument("--recover-stale-minutes", type=int)
+
+    interaction_retry_parser = subparsers.add_parser(
+        "interaction-retry", help="queue a saved failed reply for bridge recovery delivery"
+    )
+    interaction_retry_parser.add_argument("interaction_id", type=int)
+
     daily_report_parser = subparsers.add_parser("daily-report", help="write a local Markdown audit report for Codex review")
     daily_report_parser.add_argument("--date", default="today", help="today, yesterday, or YYYY-MM-DD")
     daily_report_parser.add_argument("--last-hours", type=int, help="write a rolling report for the previous N hours")
@@ -100,6 +109,12 @@ def main(argv: list[str] | None = None) -> int:
     configure_utf8_stdio()
     args = build_parser().parse_args(argv)
     brain = PersonalBrain.from_config_file(args.config)
+
+    if args.command in {
+        "ingest", "memory-archive", "secure-add", "embed-memories",
+        "raw-reprocess", "interaction-retry",
+    }:
+        brain.init_db()
 
     if args.command == "init-db":
         result = brain.init_db()
@@ -181,12 +196,39 @@ def main(argv: list[str] | None = None) -> int:
         for index, item in enumerate(interactions):
             if index:
                 print("")
-            print(f"#{item['id']} {item['created_at']} source={item['source']} action={item['action']} status={item['status']} latency_ms={item['latency_ms']}")
+            print(
+                f"#{item['id']} {item['created_at']} source={item['source']} action={item['action']} "
+                f"status={item['status']} processing={item['processing_status']} "
+                f"delivery={item['delivery_status']} attempt={item['attempt_count']} "
+                f"latency_ms={item['latency_ms']}"
+            )
             print(f"  user: {short_text(item['user_text'], 160)}")
             if item["reply_text"]:
                 print(f"  reply: {short_text(item['reply_text'], 220)}")
             if item["error"]:
                 print(f"  error: {item['error']}")
+        return 0
+
+    if args.command == "raw-reprocess":
+        try:
+            result = brain.raw_reprocess(
+                args.raw_message_id, recover_stale_minutes=args.recover_stale_minutes
+            )
+        except (KeyError, RuntimeError, ValueError) as exc:
+            print(f"warning: {exc}")
+            return 1
+        print(f"raw_message_id: {result.raw_message_id}")
+        print(f"extraction_run_id: {result.extraction_run_id}")
+        print(f"memories: {result.memory_ids}")
+        return 0
+
+    if args.command == "interaction-retry":
+        try:
+            item = brain.prepare_interaction_retry(args.interaction_id)
+        except (KeyError, RuntimeError) as exc:
+            print(f"warning: {exc}")
+            return 1
+        print(f"interaction #{item['id']} queued for saved-reply delivery on bridge startup")
         return 0
 
     if args.command == "daily-report":

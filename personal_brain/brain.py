@@ -68,6 +68,7 @@ class PersonalBrain:
         source: str = "cli",
         sender: str = "me",
         rebuild_router: bool = True,
+        source_message_id: str | None = None,
     ) -> IngestResult:
         input_route = route_input(text).as_debug_dict()
         extractor = MemoryExtractor(
@@ -75,11 +76,14 @@ class PersonalBrain:
             chat_model=self.chat_model,
             chat_config=self.config.chat_model,
         )
-        result = extractor.ingest(text=text, source=source, sender=sender)
+        result = extractor.ingest(
+            text=text, source=source, sender=sender, source_message_id=source_message_id
+        )
+        recovered = bool(result.warning and result.warning.startswith("recovered committed"))
         warning = result.warning
-        if result.memory_ids:
+        if result.memory_ids and not recovered:
             warning = self._embed_ingested_memories(result.memory_ids, warning)
-        if rebuild_router:
+        if rebuild_router and not recovered:
             self.build_router()
             return IngestResult(
                 raw_message_id=result.raw_message_id,
@@ -223,17 +227,20 @@ class PersonalBrain:
         evidence: list[dict[str, Any]] | None = None,
         error: str | None = None,
         latency_ms: int | None = None,
+        idempotency_key: str | None = None,
+        processing_status: str = "pending",
+        delivery_status: str = "unknown",
     ) -> int:
-        self.schema.initialize()
         evidence_json = json.dumps(evidence, ensure_ascii=False) if evidence is not None else None
-        with self.schema.connect() as conn:
+        with self.schema.connect_write() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO interaction_logs (
                     message_id, source, sender, user_text, mode, action,
-                    raw_message_id, reply_text, evidence_json, status, error, latency_ms
+                    raw_message_id, reply_text, evidence_json, status, error, latency_ms,
+                    idempotency_key, processing_status, delivery_status
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     message_id,
@@ -248,6 +255,9 @@ class PersonalBrain:
                     status,
                     error,
                     latency_ms,
+                    idempotency_key,
+                    processing_status,
+                    delivery_status,
                 ),
             )
             return int(cursor.lastrowid)
@@ -255,8 +265,7 @@ class PersonalBrain:
     def has_interaction_message(self, message_id: str | None) -> bool:
         if not message_id:
             return False
-        self.schema.initialize()
-        with self.schema.connect() as conn:
+        with self.schema.connect_readonly() as conn:
             row = conn.execute(
                 """
                 SELECT 1
@@ -269,14 +278,14 @@ class PersonalBrain:
             return row is not None
 
     def list_interactions(self, limit: int = 20) -> list[dict[str, Any]]:
-        self.schema.initialize()
-        with self.schema.connect() as conn:
+        with self.schema.connect_readonly() as conn:
             rows = conn.execute(
                 """
                 SELECT
                     id, message_id, source, sender, user_text, mode, action,
                     raw_message_id, reply_text, evidence_json, status, error,
-                    latency_ms, created_at
+                    latency_ms, created_at, idempotency_key, processing_status,
+                    delivery_status, attempt_count, updated_at, delivered_at
                 FROM interaction_logs
                 ORDER BY created_at DESC, id DESC
                 LIMIT ?
@@ -284,6 +293,151 @@ class PersonalBrain:
                 (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def claim_interaction(
+        self, *, message_id: str, source: str, sender: str, user_text: str, mode: str,
+        action: str = "pending", delivery_required: bool = True,
+    ) -> tuple[int, bool]:
+        """Atomically persist an inbox item before acknowledging its producer."""
+        key = f"{source}:{message_id}"
+        delivery = "pending" if delivery_required else "not_required"
+        with self.schema.connect_write() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO interaction_logs (
+                    message_id, source, sender, user_text, mode, action, status,
+                    idempotency_key, processing_status, delivery_status
+                ) VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?, 'pending', ?)
+                ON CONFLICT(idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+                """,
+                (message_id, source, sender, user_text, mode, action, key, delivery),
+            )
+            if cursor.rowcount:
+                return int(cursor.lastrowid), True
+            row = conn.execute(
+                "SELECT id FROM interaction_logs WHERE idempotency_key=?", (key,)
+            ).fetchone()
+            return int(row["id"]), False
+
+    def claim_interaction_processing(self, interaction_id: int) -> bool:
+        with self.schema.connect_write() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE interaction_logs
+                SET processing_status='processing', status='processing',
+                    attempt_count=attempt_count+1, updated_at=datetime('now', 'localtime')
+                WHERE id=? AND (
+                    processing_status='pending'
+                    OR (processing_status='processing' AND updated_at <= datetime('now', '-15 minutes'))
+                )
+                """,
+                (interaction_id,),
+            )
+            return cursor.rowcount == 1
+
+    def save_interaction_reply(
+        self, interaction_id: int, *, action: str, reply_text: str,
+        raw_message_id: int | None = None, evidence: list[dict[str, Any]] | None = None,
+        processing_succeeded: bool = True, error: str | None = None,
+        latency_ms: int | None = None,
+    ) -> None:
+        evidence_json = json.dumps(evidence, ensure_ascii=False) if evidence is not None else None
+        processing = "ignored" if processing_succeeded and action == "ignored" else ("succeeded" if processing_succeeded else "failed")
+        overall = "ignored" if processing == "ignored" else ("reply_pending" if processing_succeeded else "processing_failed")
+        with self.schema.connect_write() as conn:
+            conn.execute(
+                """
+                UPDATE interaction_logs
+                SET action=?, reply_text=?, raw_message_id=?, evidence_json=?, error=?, latency_ms=?,
+                    processing_status=?, delivery_status='pending', status=?,
+                    updated_at=datetime('now', 'localtime')
+                WHERE id=?
+                """,
+                (action, reply_text, raw_message_id, evidence_json, error, latency_ms,
+                 processing, overall, interaction_id),
+            )
+
+    def mark_interaction_delivery(self, interaction_id: int, *, succeeded: bool, dry_run: bool = False, error: str | None = None) -> None:
+        delivery = "dry_run" if dry_run else ("succeeded" if succeeded else "failed")
+        with self.schema.connect_write() as conn:
+            row = conn.execute(
+                "SELECT processing_status FROM interaction_logs WHERE id=?", (interaction_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"interaction not found: {interaction_id}")
+            if dry_run:
+                overall = "dry_run"
+            elif not succeeded:
+                overall = "delivery_failed"
+            else:
+                overall = (
+                    "succeeded" if row["processing_status"] == "succeeded"
+                    else ("ignored" if row["processing_status"] == "ignored" else "processing_failed")
+                )
+            conn.execute(
+                """
+                UPDATE interaction_logs SET delivery_status=?, status=?, error=COALESCE(?, error),
+                    delivered_at=CASE WHEN ? THEN datetime('now', 'localtime') ELSE delivered_at END,
+                    updated_at=datetime('now', 'localtime') WHERE id=?
+                """,
+                (delivery, overall, error, succeeded and not dry_run, interaction_id),
+            )
+
+    def mark_interaction_ignored(self, interaction_id: int, *, action: str, note: str) -> None:
+        with self.schema.connect_write() as conn:
+            conn.execute(
+                """
+                UPDATE interaction_logs SET action=?, reply_text=?, processing_status='ignored',
+                    delivery_status='not_required', status='ignored',
+                    updated_at=datetime('now', 'localtime') WHERE id=?
+                """,
+                (action, note, interaction_id),
+            )
+
+    def get_interaction(self, interaction_id: int) -> dict[str, Any]:
+        with self.schema.connect_readonly() as conn:
+            row = conn.execute("SELECT * FROM interaction_logs WHERE id=?", (interaction_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"interaction not found: {interaction_id}")
+            return dict(row)
+
+    def prepare_interaction_retry(self, interaction_id: int) -> dict[str, Any]:
+        """CAS a saved reply for delivery by the bridge recovery worker."""
+        with self.schema.connect_write() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE interaction_logs SET delivery_status='pending', status='reply_pending',
+                    updated_at=datetime('now', 'localtime')
+                WHERE id=? AND delivery_status IN ('pending', 'failed') AND reply_text IS NOT NULL
+                """,
+                (interaction_id,),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"interaction {interaction_id} is not reply_pending/delivery_failed with a saved reply"
+                )
+            row = conn.execute("SELECT * FROM interaction_logs WHERE id=?", (interaction_id,)).fetchone()
+            return dict(row)
+
+    def recoverable_interactions(self) -> list[dict[str, Any]]:
+        with self.schema.connect_readonly() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM interaction_logs
+                WHERE idempotency_key IS NOT NULL AND (processing_status='pending'
+                   OR (processing_status='processing' AND updated_at <= datetime('now', '-15 minutes'))
+                   OR delivery_status IN ('pending', 'failed'))
+                ORDER BY id
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def raw_reprocess(self, raw_message_id: int, *, recover_stale_minutes: int | None = None) -> IngestResult:
+        extractor = MemoryExtractor(self.schema, self.chat_model, self.config.chat_model)
+        result = extractor.reprocess(raw_message_id, recover_stale_minutes=recover_stale_minutes)
+        if result.memory_ids:
+            self._embed_ingested_memories(result.memory_ids, result.warning)
+        return result
 
     def review_memories(self, limit: int = 80, raw_message_id: int | None = None) -> MemoryReviewResult:
         reviewer = MemoryReviewer(schema=self.schema, chat_model=self.chat_model)

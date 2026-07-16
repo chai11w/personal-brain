@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import re
 import ssl
 import sys
@@ -105,6 +106,10 @@ class FeishuBrainBridge:
         self.options = options
         self._seen_event_ids: set[str] = set()
         self._lock = threading.Lock()
+        self._jobs: queue.Queue[tuple[int, str, str, str, bool] | None] = queue.Queue(maxsize=256)
+        self._worker = threading.Thread(target=self._worker_loop, name="feishu-brain-worker", daemon=False)
+        self._worker.start()
+        self._recover_jobs()
 
     def handle_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         if "encrypt" in payload:
@@ -137,19 +142,22 @@ class FeishuBrainBridge:
         if not message_id or not text:
             return {"ok": True, "ignored": "non-text-or-missing-message"}
 
-        if self.brain.has_interaction_message(message_id):
-            print(f"ignored duplicate Feishu message_id={message_id}", flush=True)
+        message_created_at = extract_message_created_at(payload, event, message)
+        stale = is_stale_message(message_created_at, self.options.max_message_age_seconds)
+        try:
+            interaction_id, created = self.brain.claim_interaction(
+                message_id=message_id, source="feishu", sender=sender, user_text=text,
+                mode=self.options.mode, delivery_required=not stale,
+            )
+        except Exception as exc:
+            return {"ok": False, "unavailable": True, "error": f"interaction persistence failed: {exc}"}
+        if not created:
             return {"ok": True, "duplicate_message": message_id}
 
-        message_created_at = extract_message_created_at(payload, event, message)
-        if is_stale_message(message_created_at, self.options.max_message_age_seconds):
+        if stale:
             age_seconds = int(time.time() - message_created_at) if message_created_at else None
-            self._record_stale_interaction(
-                message_id=message_id,
-                text=text,
-                sender=sender,
-                age_seconds=age_seconds,
-            )
+            note = f"stale Feishu message ignored; age_seconds={age_seconds}; no reply sent"
+            self.brain.mark_interaction_ignored(interaction_id, action="stale_ignored", note=note)
             print(
                 f"ignored stale Feishu message_id={message_id} age_seconds={age_seconds}",
                 flush=True,
@@ -157,23 +165,53 @@ class FeishuBrainBridge:
             return {"ok": True, "ignored": "stale-message", "message_id": message_id}
 
         self._mark_working_async(message_id)
-        thread = threading.Thread(
-            target=self._process_and_reply,
-            args=(message_id, text, sender),
-            daemon=True,
-        )
-        thread.start()
+        try:
+            self._jobs.put_nowait((interaction_id, message_id, text, sender, False))
+        except queue.Full:
+            # The durable pending row remains recoverable after restart.
+            return {"ok": True, "accepted": message_id, "queued": False}
         return {"ok": True, "accepted": message_id}
 
-    def _process_and_reply(self, message_id: str, text: str, sender: str) -> None:
+    def _worker_loop(self) -> None:
+        while True:
+            job = self._jobs.get()
+            try:
+                if job is None:
+                    return
+                self._process_and_reply(*job)
+            finally:
+                self._jobs.task_done()
+
+    def _recover_jobs(self) -> None:
+        for item in self.brain.recoverable_interactions():
+            delivery_only = item["processing_status"] in {"succeeded", "failed"} and bool(item["reply_text"])
+            try:
+                self._jobs.put_nowait((
+                    int(item["id"]), str(item["message_id"] or ""), str(item["user_text"]),
+                    str(item["sender"]), delivery_only,
+                ))
+            except queue.Full:
+                break
+
+    def shutdown(self, timeout: float = 10.0) -> None:
+        self._jobs.put(None, timeout=max(0.1, timeout))
+        self._worker.join(timeout=max(0.1, timeout))
+
+    def _process_and_reply(self, interaction_id: int, message_id: str, text: str, sender: str, delivery_only: bool = False) -> None:
         print(f"received from {sender}: {text}", flush=True)
+        if delivery_only:
+            item = self.brain.get_interaction(interaction_id)
+            self._deliver(interaction_id, message_id, str(item["reply_text"]))
+            return
+        if not self.brain.claim_interaction_processing(interaction_id):
+            return
         started_at = time.perf_counter()
         status = "succeeded"
         error = None
         bridge_reply: BridgeReply | None = None
         with self._lock:
             try:
-                bridge_reply = self._reply_for_text(text, sender)
+                bridge_reply = self._reply_for_text(text, sender, message_id)
                 reply = bridge_reply.text
             except Exception as exc:
                 status = "failed"
@@ -182,27 +220,28 @@ class FeishuBrainBridge:
                 bridge_reply = BridgeReply(text=reply, action="error")
 
         latency_ms = int((time.perf_counter() - started_at) * 1000)
-        self._record_interaction(
-            message_id=message_id,
-            text=text,
-            sender=sender,
-            reply=bridge_reply,
-            status=status,
-            error=error,
-            latency_ms=latency_ms,
+        self.brain.save_interaction_reply(
+            interaction_id, action=bridge_reply.action, reply_text=bridge_reply.text,
+            raw_message_id=bridge_reply.raw_message_id, evidence=bridge_reply.evidence,
+            processing_succeeded=status == "succeeded", error=error, latency_ms=latency_ms,
         )
+        self._deliver(interaction_id, message_id, reply)
 
+    def _deliver(self, interaction_id: int, message_id: str, reply: str) -> None:
         if self.options.dry_run:
             print(f"dry-run reply to {message_id}: {reply}", flush=True)
+            self.brain.mark_interaction_delivery(interaction_id, succeeded=False, dry_run=True)
             return
 
         try:
             self.client.reply_text(message_id, reply)
+            self.brain.mark_interaction_delivery(interaction_id, succeeded=True)
             print(f"replied to {message_id}: {reply}", flush=True)
         except Exception as exc:
+            self.brain.mark_interaction_delivery(interaction_id, succeeded=False, error=str(exc))
             print(f"failed to reply {message_id}: {exc}", file=sys.stderr, flush=True)
 
-    def _reply_for_text(self, text: str, sender: str) -> BridgeReply:
+    def _reply_for_text(self, text: str, sender: str, message_id: str | None = None) -> BridgeReply:
         if is_help_command(text):
             return BridgeReply(text=format_help_reply(self.options.ask_prefix), action="help")
 
@@ -234,7 +273,7 @@ class FeishuBrainBridge:
                 raw_message_id=result.raw_message_id,
             )
         if self.options.mode == "remember":
-            return self._remember_text(text, sender)
+            return self._remember_text(text, sender, message_id)
         if self.options.mode == "ask":
             result = self.brain.ask(text)
             return BridgeReply(text=result.answer, action="ask", evidence=answer_evidence_payload(result))
@@ -243,7 +282,7 @@ class FeishuBrainBridge:
             if question:
                 result = self.brain.ask(question)
                 return BridgeReply(text=result.answer, action="ask", evidence=answer_evidence_payload(result))
-            return self._remember_text(text, sender)
+            return self._remember_text(text, sender, message_id)
         raise ValueError(f"unsupported mode: {self.options.mode}")
 
     def _mark_working_async(self, message_id: str) -> None:
@@ -266,22 +305,30 @@ class FeishuBrainBridge:
         except Exception as exc:
             print(f"failed to react {message_id}: {exc}", file=sys.stderr, flush=True)
 
-    def _remember_text(self, text: str, sender: str) -> BridgeReply:
-        result = self.brain.ingest(text, sender=sender, source="feishu")
+    def _remember_text(self, text: str, sender: str, message_id: str | None = None) -> BridgeReply:
+        result = self.brain.ingest(
+            text, sender=sender, source="feishu", source_message_id=message_id
+        )
         if result.memory_ids:
             details = [self.brain.memory_show(memory_id) for memory_id in result.memory_ids]
             reply = format_remembered_reply(self.options.ack_message, details)
             if result.warning:
                 reply = f"{reply}\n\n提醒：{result.warning}"
             return BridgeReply(text=reply, action="remember", raw_message_id=result.raw_message_id)
+        if result.should_remember:
+            return BridgeReply(
+                text="已处理，这次没有新增长期记忆；可能是候选已存在或没有产生新条目。",
+                action="received",
+                raw_message_id=result.raw_message_id,
+            )
         if result.warning:
             return BridgeReply(
-                text="Personal Brain 收到了，不过这句不像长期记忆，我先不存。",
+                text="已收到，不过这句没有写入长期记忆。",
                 action="ignored",
                 raw_message_id=result.raw_message_id,
             )
         return BridgeReply(
-            text=self.options.ack_message or "Personal Brain 记住了。",
+            text=self.options.ack_message or "Personal Brain 已记住。",
             action="received",
             raw_message_id=result.raw_message_id,
         )
@@ -376,7 +423,7 @@ class FeishuHandler(BaseHTTPRequestHandler):
             return
 
         result = self.bridge.handle_payload(payload)
-        status = 200 if result.get("ok", True) else 403
+        status = 503 if result.get("unavailable") else (200 if result.get("ok", True) else 403)
         self._send_json(result, status=status)
 
     def log_message(self, format: str, *args: object) -> None:
@@ -398,7 +445,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--mode", choices=["remember", "ask", "auto"], default="auto")
     parser.add_argument("--ask-prefix", default="?")
-    parser.add_argument("--ack-message", default="Personal Brain 记住了。")
+    parser.add_argument("--ack-message", default="Personal Brain 已记住。")
     parser.add_argument(
         "--working-reaction",
         default="OK",
@@ -426,6 +473,7 @@ def main(argv: list[str] | None = None) -> int:
     verification_token = get_secret_env(args.verification_token_env)
 
     brain = PersonalBrain.from_config_file(args.config)
+    brain.init_db()
     client = FeishuClient(app_id=app_id, app_secret=app_secret)
     options = FeishuOptions(
         mode=args.mode,
@@ -438,11 +486,17 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         max_message_age_seconds=max(0, args.max_message_age_minutes) * 60,
     )
-    FeishuHandler.bridge = FeishuBrainBridge(brain=brain, client=client, options=options)
+    bridge = FeishuBrainBridge(brain=brain, client=client, options=options)
+    FeishuHandler.bridge = bridge
     server = ThreadingHTTPServer((args.host, args.port), FeishuHandler)
     print(f"Feishu bridge listening on http://{args.host}:{args.port}/feishu/events", flush=True)
     print(f"mode={args.mode} ask_prefix={args.ask_prefix!r} dry_run={args.dry_run}", flush=True)
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.shutdown()
+        server.server_close()
+        bridge.shutdown(timeout=10.0)
     return 0
 
 
@@ -560,7 +614,7 @@ def format_help_reply(ask_prefix: str) -> str:
             "Personal Brain 快捷指令：",
             "",
             "普通发送：记住一条内容，AI 会判断是否值得长期记忆。",
-            f"{question_prefix}问题：从已有记忆里检索并回答，例如：{question_prefix}我之前如何定义这个项目？",
+            f"{question_prefix}问题：从已有记忆里检索并回答，例如：{question_prefix}我之前对 Personal Brain 有什么看法？",
             "#91：查看某条记忆的原始输入和实际存入内容。",
             "-91：作废某条记忆；原始输入和审计记录仍保留。",
             "!：显示这份快捷指令。",
@@ -580,7 +634,7 @@ def format_memory_detail_reply(detail: MemoryDetail) -> str:
         f"来源：{detail.raw_source} / {detail.raw_sender} / {detail.raw_created_at}",
         detail.raw_content,
         "",
-        "Personal Brain 存成的是：",
+        "Personal Brain 保存为：",
         f"标题：{detail.summary.title or '无标题'}",
         f"大类：{detail.summary.memory_category}",
         f"类型：{detail.summary.memory_type}",
@@ -608,7 +662,7 @@ def format_memory_detail_reply(detail: MemoryDetail) -> str:
 
 
 def format_remembered_reply(ack_message: str, details: list[MemoryDetail]) -> str:
-    lines = [ack_message or "Personal Brain 记住了。"]
+    lines = [ack_message or "Personal Brain 已记住。"]
     if len(details) >= 4:
         lines.append(f"这句话被拆成了 {len(details)} 条记忆，后续可以复盘是否拆得过细。")
     for index, detail in enumerate(details, start=1):

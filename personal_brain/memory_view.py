@@ -43,8 +43,7 @@ class MemoryView:
         self.schema = schema
 
     def list_memories(self, limit: int = 20) -> list[MemorySummary]:
-        self.schema.initialize()
-        with self.schema.connect() as conn:
+        with self.schema.connect_readonly() as conn:
             rows = conn.execute(
                 """
                 SELECT id, title, content, memory_category, memory_type, importance, confidence, created_at
@@ -74,8 +73,7 @@ class MemoryView:
         return summaries
 
     def show_memory(self, memory_id: int) -> MemoryDetail:
-        self.schema.initialize()
-        with self.schema.connect() as conn:
+        with self.schema.connect_readonly() as conn:
             row = conn.execute(
                 """
                 SELECT

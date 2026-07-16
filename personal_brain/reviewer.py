@@ -24,11 +24,10 @@ class MemoryReviewer:
         self.chat_model = chat_model
 
     def review(self, limit: int = 80, raw_message_id: int | None = None) -> MemoryReviewResult:
-        self.schema.initialize()
         if not self.chat_model.available:
             raise RuntimeError("chat model unavailable; configure chat_model before review")
 
-        with self.schema.connect() as conn:
+        with self.schema.connect_readonly() as conn:
             memories = load_memories(conn, limit=limit, raw_message_id=raw_message_id)
             raw_messages = load_raw_messages(conn, memories)
 
@@ -41,7 +40,7 @@ class MemoryReviewer:
                 "识别低价值记忆、过细拆分、重复记忆、需要合并的记忆。",
                 "保留 raw evidence，不建议删除原始 raw_messages。",
                 "只给建议，不执行修改。",
-                "优先让个人记忆系统形成可复用的第二大脑，而不是无限堆积的数据库。",
+                "优先让 Personal Brain 成为可信的第二大脑，而不是无限堆积的数据库。",
             ],
             "rules": [
                 "所有建议必须使用中文，专有名词除外。",

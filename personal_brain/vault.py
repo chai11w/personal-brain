@@ -68,12 +68,11 @@ class SecureVault:
         clean_secret = required_text(secret, "secret")
         clean_master = required_text(master_password, "master_password")
 
-        self.schema.initialize()
         salt = os.urandom(16)
         entropy = derive_entropy(clean_master, salt)
         encrypted = dpapi_protect(clean_secret.encode("utf-8"), entropy)
 
-        with self.schema.connect() as conn:
+        with self.schema.connect_write() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO secure_items (
@@ -110,8 +109,7 @@ class SecureVault:
             return int(row["id"])
 
     def list_items(self) -> list[SecureItemSummary]:
-        self.schema.initialize()
-        with self.schema.connect() as conn:
+        with self.schema.connect_readonly() as conn:
             rows = conn.execute(
                 """
                 SELECT id, label, secret_type, username, note, created_at, updated_at
@@ -124,8 +122,7 @@ class SecureVault:
     def get_item(self, label: str, master_password: str) -> SecureItemSecret:
         clean_label = required_text(label, "label")
         clean_master = required_text(master_password, "master_password")
-        self.schema.initialize()
-        with self.schema.connect() as conn:
+        with self.schema.connect_readonly() as conn:
             row = conn.execute(
                 """
                 SELECT *

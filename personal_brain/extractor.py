@@ -65,21 +65,141 @@ class MemoryExtractor:
         source: str = "cli",
         sender: str = "me",
         metadata: dict[str, Any] | None = None,
+        source_message_id: str | None = None,
     ) -> IngestResult:
         content = text.strip()
         if not content:
             raise ValueError("ingest text cannot be empty")
 
-        self.schema.initialize()
-        raw_message_id = self._insert_raw_message(content, source, sender, metadata)
+        raw_message_id, created = self.capture_raw(
+            content, source, sender, metadata, source_message_id=source_message_id
+        )
+        if not created:
+            with self.schema.connect_readonly() as conn:
+                row = conn.execute(
+                    "SELECT processed_status FROM raw_messages WHERE id=?", (raw_message_id,)
+                ).fetchone()
+            if row and row["processed_status"] in {"processed", "ignored"}:
+                return self.resume_ingest_result(raw_message_id)
+        return self.process_raw(raw_message_id)
+
+    def resume_ingest_result(self, raw_message_id: int) -> IngestResult:
+        """Rebuild a committed terminal result without model calls or writes."""
+        with self.schema.connect_readonly() as conn:
+            raw = conn.execute(
+                "SELECT processed_status FROM raw_messages WHERE id=?", (raw_message_id,)
+            ).fetchone()
+            if raw is None:
+                raise KeyError(f"raw message not found: {raw_message_id}")
+            status = str(raw["processed_status"])
+            if status not in {"processed", "ignored"}:
+                raise RuntimeError(f"raw message {raw_message_id} is not terminal: {status}")
+            run = conn.execute(
+                """
+                SELECT id, output_json FROM memory_extraction_runs
+                WHERE raw_message_id=? AND status='succeeded' ORDER BY id DESC LIMIT 1
+                """,
+                (raw_message_id,),
+            ).fetchone()
+            if run is None:
+                raise RuntimeError("committed recovery evidence is inconsistent: no succeeded extraction run")
+            try:
+                payload = json.loads(str(run["output_json"]))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("committed recovery evidence is inconsistent: invalid run output") from exc
+            should_remember = bool(payload.get("should_remember", False))
+            if (status == "processed") != should_remember:
+                raise RuntimeError("committed recovery evidence is inconsistent: raw/run terminal mismatch")
+            extraction_run_id = int(run["id"])
+            memory_rows = conn.execute(
+                "SELECT id FROM memories WHERE raw_message_id=? AND extraction_run_id=? ORDER BY id",
+                (raw_message_id, extraction_run_id),
+            ).fetchall()
+            memory_ids = [int(row["id"]) for row in memory_rows]
+            if status == "ignored" and memory_ids:
+                raise RuntimeError("committed recovery evidence is inconsistent: ignored raw has memories")
+            topic_ids = [
+                int(row["topic_id"]) for row in conn.execute(
+                    "SELECT DISTINCT topic_id FROM memory_topics WHERE memory_id IN "
+                    f"({','.join('?' for _ in memory_ids)}) ORDER BY topic_id",
+                    memory_ids,
+                ).fetchall()
+            ] if memory_ids else []
+            entity_ids = [
+                int(row["entity_id"]) for row in conn.execute(
+                    "SELECT DISTINCT entity_id FROM memory_entities WHERE memory_id IN "
+                    f"({','.join('?' for _ in memory_ids)}) ORDER BY entity_id",
+                    memory_ids,
+                ).fetchall()
+            ] if memory_ids else []
+        warning = "recovered committed extraction result without rerunning models"
+        return IngestResult(
+            raw_message_id=raw_message_id, extraction_run_id=extraction_run_id,
+            memory_ids=memory_ids, topic_ids=topic_ids, entity_ids=entity_ids,
+            should_remember=should_remember, router_rebuilt=False, warning=warning,
+        )
+
+    def capture_raw(
+        self,
+        content: str,
+        source: str,
+        sender: str,
+        metadata: dict[str, Any] | None = None,
+        *,
+        source_message_id: str | None = None,
+    ) -> tuple[int, bool]:
+        """Persist raw evidence once; return (id, newly_created)."""
+        clean = content.strip()
+        if not clean:
+            raise ValueError("ingest text cannot be empty")
+        metadata_json = json.dumps(metadata, ensure_ascii=False) if metadata else None
+        with self.schema.connect_write() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO raw_messages (
+                    content, source, sender, metadata_json, processed_status, source_message_id
+                ) VALUES (?, ?, ?, ?, 'pending', ?)
+                ON CONFLICT(source, source_message_id) WHERE source_message_id IS NOT NULL DO NOTHING
+                """,
+                (clean, source, sender, metadata_json, source_message_id),
+            )
+            if cursor.rowcount:
+                return int(cursor.lastrowid), True
+            row = conn.execute(
+                "SELECT id FROM raw_messages WHERE source = ? AND source_message_id = ?",
+                (source, source_message_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("failed to capture raw message")
+            return int(row["id"]), False
+
+    def process_raw(self, raw_message_id: int, *, allow_failed: bool = False) -> IngestResult:
+        allowed = ("pending", "failed") if allow_failed else ("pending",)
+        placeholders = ",".join("?" for _ in allowed)
+        with self.schema.connect_write() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE raw_messages
+                SET processed_status='processing', processing_started_at=datetime('now', 'localtime'),
+                    attempt_count=attempt_count+1, last_error=NULL
+                WHERE id=? AND processed_status IN ({placeholders})
+                """,
+                (raw_message_id, *allowed),
+            )
+            if cursor.rowcount != 1:
+                row = conn.execute(
+                    "SELECT processed_status FROM raw_messages WHERE id=?", (raw_message_id,)
+                ).fetchone()
+                if row is None:
+                    raise KeyError(f"raw message not found: {raw_message_id}")
+                raise RuntimeError(f"raw message {raw_message_id} cannot be claimed from {row['processed_status']}")
+            row = conn.execute(
+                "SELECT content FROM raw_messages WHERE id=?", (raw_message_id,)
+            ).fetchone()
+            content = str(row["content"])
 
         if not self.chat_model.available:
-            extraction_run_id = self._record_failed_run(
-                raw_message_id,
-                content,
-                "chat model is not available",
-            )
-            self._mark_raw_status(raw_message_id, "failed")
+            extraction_run_id = self._fail_raw(raw_message_id, content, "chat model is not available")
             return IngestResult(
                 raw_message_id=raw_message_id,
                 extraction_run_id=extraction_run_id,
@@ -95,8 +215,7 @@ class MemoryExtractor:
             output_text = self._call_model(content)
             payload = parse_json_object(output_text)
         except Exception as exc:
-            extraction_run_id = self._record_failed_run(raw_message_id, content, str(exc))
-            self._mark_raw_status(raw_message_id, "failed")
+            self._fail_raw(raw_message_id, content, str(exc))
             raise RuntimeError(f"memory extraction failed: {exc}") from exc
 
         payload = preserve_exact_technical_tokens(content, payload)
@@ -104,6 +223,21 @@ class MemoryExtractor:
         payload = preserve_learning_note(content, payload)
         payload = preserve_temporary_todo(content, payload)
         return self._persist_extraction(raw_message_id, content, payload)
+
+    def reprocess(self, raw_message_id: int, *, recover_stale_minutes: int | None = None) -> IngestResult:
+        if recover_stale_minutes is not None:
+            if recover_stale_minutes <= 0:
+                raise ValueError("recover_stale_minutes must be positive")
+            with self.schema.connect_write() as conn:
+                conn.execute(
+                    """
+                    UPDATE raw_messages SET processed_status='failed', last_error='recovered stale processing claim'
+                    WHERE id=? AND processed_status='processing'
+                      AND processing_started_at <= datetime('now', ?)
+                    """,
+                    (raw_message_id, f"-{recover_stale_minutes} minutes"),
+                )
+        return self.process_raw(raw_message_id, allow_failed=True)
 
     def _call_model(self, content: str) -> str:
         system_prompt = (
@@ -134,9 +268,9 @@ class MemoryExtractor:
                 "topic 是小方向，memory_category 是大方向；不要把二者混在一起。",
                 "只记 durable 的偏好、决定、想法、原则、计划、反思、自我认知、处事方式或产品方向。",
                 "临时命令、普通提问、能力询问、寒暄、过短且无上下文的吐槽，应 set should_remember=false。",
-                "明确的短期待办、提醒、会议/出行准备、带有时间边界的别忘事项，应 should_remember=true，并归入“临时待办”；不要把它们拔高成长期原则。",
-                "如果用户围绕 Personal Brain、个人记忆系统、质量报告、消息入口、去重、检索、RAG 或 embedding 提出改进、缺陷、近期修复或未来方向，即使句式是问题，也应作为长期项目反馈记住。",
-                "判断问题式输入时，区分‘询问当前能力’和‘提出产品方向’：例如‘能不能让质量报告单独分类缺陷、修复和未来方向’属于项目改进，应 should_remember=true。",
+                "明确的短期待办、提醒、面试/出行准备、带有时间边界的别忘事项，应 should_remember=true，并归入“临时待办”；不要把它们拔高成长期原则。",
+                "但如果用户的问题是在围绕Personal Brain、Personal Brain、当前项目、记忆系统、日报、飞书接入、启动稳定性、去重、检索、RAG、embedding 等提出产品改进、缺陷、近期修复或未来方向，即使句式是问题，也应作为长期项目反馈记住。",
+                "判断问题式输入时，区分‘询问当前能力’和‘提出产品方向’：例如‘能不能让Personal Brain日报单独分类缺陷/修复/未来方向’属于项目改进，应 should_remember=true。",
                 "如果用户是在记录系统改进方向，要优先归入“现有项目改进”。",
                 "如果用户是在描述未来产品形态、第二个我、数字分身、接入其他软件，优先归入“未来产品设想”。",
                 "如果用户是在记录短概念、定义、区别、类比、术语理解，或类似“X 就是 Y”“X 指的是 Y”“X 可以理解为 Y”的学习笔记，且主要价值是以后理解/复习，应 should_remember=true，并归入“学习”。",
@@ -232,6 +366,30 @@ class MemoryExtractor:
             )
             return int(cursor.lastrowid)
 
+    def _fail_raw(self, raw_message_id: int, content: str, error: str) -> int:
+        with self.schema.connect_write() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO memory_extraction_runs (
+                    raw_message_id, model_provider, model_name, prompt_version,
+                    input_hash, output_json, status, error
+                ) VALUES (?, ?, ?, ?, ?, '{}', 'failed', ?)
+                """,
+                (
+                    raw_message_id, self.chat_config.provider, self.chat_config.model,
+                    PROMPT_VERSION, input_hash(content), error,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE raw_messages
+                SET processed_status='failed', processed_at=datetime('now', 'localtime'),
+                    processing_started_at=NULL, last_error=? WHERE id=?
+                """,
+                (error, raw_message_id),
+            )
+            return int(cursor.lastrowid)
+
     def _persist_extraction(
         self,
         raw_message_id: int,
@@ -284,7 +442,8 @@ class MemoryExtractor:
             conn.execute(
                 """
                 UPDATE raw_messages
-                SET processed_status = ?, processed_at = datetime('now', 'localtime')
+                SET processed_status = ?, processed_at = datetime('now', 'localtime'),
+                    processing_started_at = NULL, last_error = NULL
                 WHERE id = ?
                 """,
                 (status, raw_message_id),
@@ -519,10 +678,10 @@ def preserve_personal_brain_feedback(content: str, payload: dict[str, Any]) -> d
             "confidence": 0.68,
             "topics": [
                 {
-                    "name": "个人记忆系统改进",
-                    "description": "围绕 Personal Brain 当前缺陷、近期修复和未来方向的产品反馈",
+                    "name": "Personal Brain改进",
+                    "description": "围绕Personal Brain当前缺陷、近期修复和未来方向的产品反馈",
                     "confidence": 0.8,
-                    "reason": "用户在讨论个人记忆系统的产品改进",
+                    "reason": "用户在讨论Personal Brain的产品改进",
                 }
             ],
             "entities": [
@@ -616,7 +775,7 @@ def looks_like_learning_note(text: str) -> bool:
         return False
     if looks_like_temporary_todo(clean) or looks_like_personal_brain_feedback(clean):
         return False
-    project_terms = ("Personal Brain", "个人记忆系统", "第二大脑", "质量报告", "消息入口")
+    project_terms = ("Personal Brain", "个人记忆系统", "飞书", "日报", "当前项目")
     if any(term in clean for term in project_terms):
         return False
     if re.fullmatch(r"[\W_0-9a-zA-Z]+", clean) and not any(ch in clean for ch in ("+", "=", "：", ":")):
@@ -724,7 +883,7 @@ def looks_like_temporary_todo(text: str) -> bool:
         "周五",
         "周六",
         "周日",
-        "会议前",
+        "面试前",
         "出发前",
         "之前",
         "截止",
@@ -737,8 +896,8 @@ def looks_like_temporary_todo(text: str) -> bool:
 
 
 def classify_temporary_todo_title(text: str) -> str:
-    if "会议" in text:
-        return "会议临时待办"
+    if "面试" in text:
+        return "面试临时待办"
     if "打印" in text:
         return "打印临时待办"
     if "联系" in text:
@@ -754,10 +913,10 @@ def looks_like_personal_brain_feedback(text: str) -> bool:
         "Personal Brain",
         "个人记忆系统",
         "第二大脑",
-        "质量报告",
+        "日报",
         "提取",
-        "消息入口",
         "飞书",
+        "启动Personal Brain",
         "embedding",
         "RAG",
         "检索",
@@ -798,15 +957,15 @@ def classify_personal_brain_feedback_category(text: str) -> str:
 
 def classify_personal_brain_feedback_title(text: str) -> str:
     if any(term in text for term in ("失败", "不能", "不在线", "失效", "挂", "重复")):
-        return "个人记忆系统当前缺陷反馈"
+        return "Personal Brain当前缺陷反馈"
     if any(term in text for term in ("未来", "方向", "第二个我", "机器人")):
-        return "个人记忆系统未来方向反馈"
-    return "个人记忆系统近期改进反馈"
+        return "Personal Brain未来方向反馈"
+    return "Personal Brain近期改进反馈"
 
 
 def rewrite_personal_brain_feedback_memory(text: str) -> str:
     clean = " ".join(text.strip().split())
-    return f"用户提出一条 Personal Brain 产品反馈：{clean}"
+    return f"用户提出一条Personal Brain产品反馈：{clean}"
 
 
 def clean_required_text(value: Any, label: str) -> str:
@@ -881,9 +1040,9 @@ def find_duplicate_memory(conn: sqlite3.Connection, item: dict[str, Any]) -> int
 def normalize_for_near_duplicate(text: str) -> str:
     clean = str(text).lower()
     clean = "".join(char for char in clean if char.isalnum())
-    clean = clean.replace("个人记忆系统", "personalbrain")
-    clean = clean.replace("这个记忆系统", "personalbrain")
-    clean = clean.replace("第二大脑", "personalbrain")
+    clean = clean.replace("Personal Brain", "Personal Brain")
+    clean = clean.replace("个人记忆系统", "Personal Brain")
+    clean = clean.replace("个人记忆系统", "Personal Brain")
     return clean[:500]
 
 
@@ -898,7 +1057,7 @@ def is_same_personal_brain_feedback_intent(
     if candidate_category not in {"现有项目改进", "未来产品设想"}:
         return False
     combined = f"{candidate_text}\n{existing_text}"
-    if not any(term.lower() in combined.lower() for term in ("Personal Brain", "个人记忆系统", "第二大脑")):
+    if not any(term in combined for term in ("Personal Brain", "个人记忆系统", "第二大脑")):
         return False
     candidate_terms = personal_brain_feedback_terms(candidate_text)
     existing_terms = personal_brain_feedback_terms(existing_text)
