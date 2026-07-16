@@ -10,6 +10,7 @@ permissions:
 jobs:
   test:
     runs-on: windows-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,7 +37,7 @@ jobs:
         shell: pwsh
         run: python -c "from pathlib import Path; files=list(Path('.').rglob('*.py')); [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in files]; print(f'compiled {len(files)} files')"
       - name: Run tests
-        run: python -m unittest discover -v
+        run: python -u -m unittest discover -s tests -t . -v
       - name: Reject private paths
         run: python scripts/security/check_public_paths.py
       - name: Run offline demo
