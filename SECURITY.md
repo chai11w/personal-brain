@@ -1,24 +1,24 @@
-# Security policy
+# 安全政策
 
-## Do not submit sensitive data
+## 请勿提交敏感数据
 
-Do not open issues, pull requests, or test fixtures containing real memories, reports, database files, Router exports, credentials, account identifiers, private URLs, or screenshots from a real runtime.
+请勿在 Issue、Pull Request 或测试数据中提交真实记忆、报告、数据库文件、Router 导出、凭据、账户标识、私有网址或真实运行环境的截图。
 
-Use synthetic data created from scratch. Renaming or paraphrasing a real memory is not sufficient anonymization.
+所有演示数据都必须从零开始合成。仅仅重命名或改写一条真实记忆，并不能构成充分的匿名化处理。
 
-## Reporting a vulnerability
+## 报告安全漏洞
 
-Please use GitHub's private vulnerability reporting feature when available. Do not post secrets or personal data in a public issue.
+如需报告安全漏洞，请优先使用 GitHub 的私密漏洞报告功能。不要在公开 Issue 中发布密钥、个人数据或可用于访问私有系统的信息。
 
-## Local secret handling
+## 本地秘密管理
 
-Configuration files contain environment-variable names only. Store values in the operating-system environment or a dedicated secret manager. The offline demo and CI require no credentials.
+配置文件只保存环境变量名称，不保存对应值。秘密值应存放在操作系统环境变量或专用的秘密管理工具中。离线演示和公开 CI 均不需要任何凭据。
 
-## Publication checks
+## 发布前检查
 
-Before publishing a commit or release:
+发布提交或版本前必须完成以下检查：
 
-1. Run `python scripts/security/check_public_paths.py`.
-2. Run the test suite.
-3. Scan the full Git history and worktree with Gitleaks.
-4. Review demo text and screenshots manually for semantic privacy leaks.
+1. 运行 `python scripts/security/check_public_paths.py`。
+2. 运行完整测试：`python -m unittest discover -v`。
+3. 使用 Gitleaks 扫描完整 Git 历史和当前工作区。
+4. 人工检查演示文本和截图，排除语义层面的隐私泄露。

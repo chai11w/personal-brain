@@ -1,103 +1,103 @@
-# Personal Brain
+# Personal Brain（个人第二大脑）
 
-A local-first, evidence-first memory system that turns raw messages into traceable atomic memories and answers questions from retrieved evidence.
+一个本地优先、证据优先的记忆系统：将原始消息转化为可追溯的原子记忆，并根据检索到的证据回答问题。
 
-This repository is a privacy-safe portfolio edition. It contains source code, isolated security tooling, tests, and synthetic demo data. It contains no real user memories, production databases, Router exports, reports, credentials, or private agent context.
+本仓库是经过隐私处理的作品展示版本，只包含源代码、隔离的安全工具、测试和从零编写的合成演示数据，不包含任何真实用户记忆、生产数据库、Router 导出、报告、凭据或私有 Agent 上下文。
 
-## Why this project exists
+## 为什么做这个项目
 
-Most note systems preserve text but leave the user responsible for structuring and finding it. Personal Brain explores a different pipeline:
+大多数笔记系统只负责保存文本，信息的整理和查找仍然依赖用户。Personal Brain 探索的是另一条路径：
 
 ```text
-raw message
-→ auditable extraction run
-→ atomic memory + metadata
-→ embedding-backed recall
-→ AI rerank
-→ evidence-constrained answer
+原始消息
+→ 可审计的提取过程
+→ 原子记忆与元数据
+→ 基于向量的召回
+→ AI 重排序
+→ 受证据约束的回答
 ```
 
-The core design goal is not “more autonomous agents.” It is trustworthy memory formation and retrieval: preserve the original input, keep transformations auditable, and make every answer traceable to evidence.
+项目的核心目标不是制造“更自主的 Agent”，而是建立可信的记忆形成与检索机制：保留原始输入、让每次转换都可审计，并让每个答案都能追溯到证据。
 
-## What is implemented
+## 已实现功能
 
-- SQLite source of truth for raw messages, extraction runs, memories, topics, entities, embeddings, and interactions.
-- AI-assisted atomic-memory extraction with prompt-version audit records.
-- Semantic recall with lexical, same-day task, and lifecycle adjustments.
-- AI reranking and evidence-constrained answers with memory/raw-message citations.
-- Read-only audit reports and Router exports.
-- Archive/detail operations and a Windows DPAPI-backed secure vault.
-- A generic Feishu adapter.
-- Private-path guards, redacted secret scanning, consistent SQLite backup, and isolated restore verification.
+- 使用 SQLite 保存原始消息、提取记录、记忆、主题、实体、向量和交互记录，作为唯一事实来源。
+- AI 辅助的原子记忆提取，并记录提示词版本以便审计。
+- 语义召回，同时结合关键词、同日任务和生命周期等调整信号。
+- AI 重排序与证据约束回答，支持引用记忆 ID 和原始消息 ID。
+- 只读审查报告与 Router 导出。
+- 归档、详情查看，以及基于 Windows DPAPI 的安全凭据库。
+- 通用飞书适配器。
+- 私有路径守卫、脱敏秘密扫描、SQLite 一致性备份与隔离恢复验证。
 
-## Known limitations
+## 当前局限
 
-- The current vector search scans stored vectors in Python and scales linearly.
-- Retrieval quality needs a larger gold-set evaluation before adopting query-planning Agent RAG.
-- Fact, user opinion, hypothesis, effective time, and supersession are not yet modeled as independent dimensions.
-- Some read-oriented code paths still initialize schema state; production-grade read/write separation is future work.
-- The Feishu adapter and secure vault are Windows-oriented and are not exercised in public CI.
+- 当前向量检索由 Python 遍历已存储向量，数据量增大后耗时近似线性增长。
+- 在引入查询规划型 Agent RAG 前，还需要用更大的标准问题集评估检索质量。
+- 事实、用户观点、假设、生效时间和替代关系尚未建模为相互独立的维度。
+- 部分只读代码路径仍会初始化数据库结构；生产级读写分离仍是后续工作。
+- 飞书适配器和安全凭据库偏向 Windows 环境，暂未纳入公开 CI。
 
-## Architecture
+## 系统架构
 
 ```mermaid
 flowchart LR
-    A["Raw input"] --> B["raw_messages"]
-    B --> C["AI extraction"]
+    A["原始输入"] --> B["raw_messages"]
+    B --> C["AI 提取"]
     C --> D["memory_extraction_runs"]
-    C --> E["atomic memories"]
-    E --> F["topics / entities"]
-    E --> G["embeddings"]
-    Q["Question"] --> H["semantic + lexical recall"]
+    C --> E["原子记忆"]
+    E --> F["主题 / 实体"]
+    E --> G["向量"]
+    Q["用户问题"] --> H["语义 + 关键词召回"]
     G --> H
-    H --> I["AI rerank"]
-    I --> J["evidence-constrained answer"]
+    H --> I["AI 重排序"]
+    I --> J["证据约束回答"]
     B --> J
 ```
 
-See [docs/architecture.md](docs/architecture.md) for design choices and [docs/security-boundary.md](docs/security-boundary.md) for the public/private data boundary.
+设计说明见 [docs/architecture.md](docs/architecture.md)，公开与私有数据边界见 [docs/security-boundary.md](docs/security-boundary.md)。
 
-## Five-minute offline demo
+## 五分钟离线演示
 
-The demo uses deterministic bag-of-words vectors and data written from scratch for this repository. Fixtures cover a preference, project decisions, a temporary task, a technical viewpoint, a superseded decision, and queries with no matching evidence. It does not access a model, network, local configuration, or production database.
+演示使用确定性的词袋向量，以及专门为本仓库从零编写的合成数据。测试数据覆盖偏好、项目决策、临时任务、技术观点、已被替代的决策和无匹配证据的问题。运行过程不会访问模型、网络、本地配置或生产数据库。
 
 ```powershell
 python demo/offline_demo.py
 python demo/offline_demo.py "What notification policy did the team choose?"
 ```
 
-## Run the security tests
+## 运行测试
 
 ```powershell
-python -m unittest tests.security.test_security_tools -v
+python -m unittest discover -v
 ```
 
-The tests create isolated temporary Git repositories and a synthetic SQLite database. They never read a production database.
+安全测试会创建隔离的临时 Git 仓库和合成 SQLite 数据库，不会读取生产数据库。
 
-## Optional model-backed setup
+## 可选的模型配置
 
-1. Copy `config.example.json` to `config.json`.
-2. Keep both model integrations disabled until you intentionally configure them.
-3. Store API keys in environment variables, never in JSON files.
-4. Initialize a new local database:
+1. 将 `config.example.json` 复制为 `config.json`。
+2. 在明确完成配置前，保持两个模型集成都处于禁用状态。
+3. API 密钥只能保存在环境变量或专用秘密管理工具中，不能写入 JSON 文件。
+4. 初始化一个新的本地数据库：
 
 ```powershell
 python brain.py init-db
 ```
 
-The runtime database, reports, Router exports, logs, backups, and local configuration are ignored by Git.
+运行时数据库、报告、Router 导出、日志、备份和本地配置均已被 Git 忽略。
 
-## Repository safety
+## 仓库安全边界
 
-- All public demo content is synthetic, not anonymized real memory.
-- CI rejects private runtime paths.
-- Gitleaks scans every new repository history before publication.
-- Backup and restore utilities refuse unignored output locations inside a Git worktree.
+- 所有公开演示内容均为合成数据，不是经过匿名化处理的真实记忆。
+- CI 会拒绝私有运行时路径进入仓库。
+- 每次发布前均使用 Gitleaks 扫描完整 Git 历史。
+- 备份和恢复工具会拒绝将输出写入 Git 工作区内未被忽略的位置。
 
-Read [SECURITY.md](SECURITY.md) and [DEMO_DATA_POLICY.md](DEMO_DATA_POLICY.md) before publishing fixtures or screenshots.
+发布测试数据或截图前，请阅读 [安全政策](SECURITY.md) 和 [演示数据政策](DEMO_DATA_POLICY.md)。
 
-## Project status
+## 项目状态
 
-This is an alpha portfolio project. The current focus is evaluation, privacy boundaries, recovery, and retrieval quality—not adding a frontend or claiming production readiness.
+这是一个 Alpha 阶段的作品集项目。目前重点是评测、隐私边界、数据恢复和检索质量，而不是添加前端或宣称已经达到生产可用状态。
 
-No open-source license has been selected yet. All rights are reserved unless a license is added later.
+目前尚未选择开源许可证；在后续加入许可证前，保留所有权利。
