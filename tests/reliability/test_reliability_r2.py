@@ -110,6 +110,11 @@ def counts(brain: PersonalBrain):
 
 
 class ReliabilityR2Tests(unittest.TestCase):
+    def make_bridge(self, brain, client):
+        bridge = FeishuBrainBridge(brain, client, options())
+        self.addCleanup(lambda: bridge.shutdown(timeout=1.0) if bridge._worker.is_alive() else None)
+        return bridge
+
     def test_r1_v2_history_maps_terminal_and_bridge_replays_zero(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -150,7 +155,7 @@ class ReliabilityR2Tests(unittest.TestCase):
             brain = PersonalBrain(BrainConfig(db, root / "router", root / "index.json"))
             self.assertEqual(brain.recoverable_interactions(), [])
             client = FakeClient()
-            bridge = FeishuBrainBridge(brain, client, options())
+            bridge = self.make_bridge(brain, client)
             bridge._jobs.join()
             self.assertEqual(client.replies, [])
             bridge.shutdown()
@@ -189,7 +194,7 @@ class ReliabilityR2Tests(unittest.TestCase):
         )
         before = counts(brain)
         client = FakeClient(fail=fail_delivery)
-        bridge = FeishuBrainBridge(brain, client, options())
+        bridge = self.make_bridge(brain, client)
         bridge._jobs.join()
         after = counts(brain)
         self.assertEqual(after, before)
@@ -233,7 +238,7 @@ class ReliabilityR2Tests(unittest.TestCase):
                 conn.execute("UPDATE interaction_logs SET updated_at=datetime('now','-20 minutes') WHERE id=?", (iid,))
             before = counts(brain)
             client = FakeClient()
-            bridge = FeishuBrainBridge(brain, client, options())
+            bridge = self.make_bridge(brain, client)
             bridge._jobs.join()
             row = brain.get_interaction(iid)
             self.assertEqual(row["processing_status"], "failed")
@@ -249,7 +254,7 @@ class ReliabilityR2Tests(unittest.TestCase):
             brain.chat_model = model
             iid, _, _, _ = seed_terminal_crash(brain, "x-mismatch", "ignored", True, False)
             before = counts(brain)
-            bridge = FeishuBrainBridge(brain, FakeClient(), options())
+            bridge = self.make_bridge(brain, FakeClient())
             bridge._jobs.join()
             row = brain.get_interaction(iid)
             self.assertEqual(row["processing_status"], "failed")
@@ -266,7 +271,7 @@ class ReliabilityR2Tests(unittest.TestCase):
         bridge.shutdown()
         before = counts(brain)
         retry_client = FakeClient()
-        retry = FeishuBrainBridge(brain, retry_client, options())
+        retry = self.make_bridge(brain, retry_client)
         retry._jobs.join()
         self.assertEqual(retry_client.replies, [(first["message_id"], saved)])
         self.assertEqual(counts(brain), before)
@@ -298,7 +303,7 @@ class ReliabilityR2Tests(unittest.TestCase):
             model = CountingChat(REMEMBER_PAYLOAD)
             brain.chat_model = model
             client = FakeClient()
-            bridge = FeishuBrainBridge(brain, client, options())
+            bridge = self.make_bridge(brain, client)
             with ThreadPoolExecutor(max_workers=20) as pool:
                 results = list(pool.map(lambda i: bridge.handle_payload(payload("e2e", f"e2e-{i}", "fixture")), range(20)))
             bridge._jobs.join()
@@ -422,4 +427,3 @@ class ReliabilityR2Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

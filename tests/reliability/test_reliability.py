@@ -92,6 +92,11 @@ def payload(message_id="m-1", event_id="e-1", text="synthetic text"):
 
 
 class ReliabilityTests(unittest.TestCase):
+    def make_bridge(self, brain, client):
+        bridge = FeishuBrainBridge(brain, client, options())
+        self.addCleanup(lambda: bridge.shutdown(timeout=1.0) if bridge._worker.is_alive() else None)
+        return bridge
+
     @classmethod
     def setUpClass(cls):
         cls.production_before = {path: fingerprint(path) for path in PRODUCTION_PATHS}
@@ -218,7 +223,7 @@ class ReliabilityTests(unittest.TestCase):
             brain = PersonalBrain(config_for(Path(td)))
             brain.init_db()
             client = FakeClient(fail=True)
-            bridge = FeishuBrainBridge(brain, client, options())
+            bridge = self.make_bridge(brain, client)
             bridge._reply_for_text = lambda text, sender, message_id=None: BridgeReply("reply", "synthetic")
             result = bridge.handle_payload(payload())
             self.assertEqual(result["accepted"], "m-1")
@@ -233,7 +238,7 @@ class ReliabilityTests(unittest.TestCase):
             bridge.shutdown()
             brain.prepare_interaction_retry(int(row["id"]))
             retry_client = FakeClient()
-            retry_bridge = FeishuBrainBridge(brain, retry_client, options())
+            retry_bridge = self.make_bridge(brain, retry_client)
             retry_bridge._jobs.join()
             self.assertEqual(retry_client.replies, [("m-1", "reply")])
             retried = brain.get_interaction(int(row["id"]))
@@ -251,7 +256,7 @@ class ReliabilityTests(unittest.TestCase):
             brain.claim_interaction_processing(interaction_id)
             brain.save_interaction_reply(interaction_id, action="synthetic", reply_text="saved")
             client = FakeClient()
-            bridge = FeishuBrainBridge(brain, client, options())
+            bridge = self.make_bridge(brain, client)
             bridge._jobs.join()
             self.assertEqual(client.replies, [("recover", "saved")])
             row = brain.get_interaction(interaction_id)
@@ -269,7 +274,7 @@ class ReliabilityTests(unittest.TestCase):
             original = FeishuBrainBridge._reply_for_text
             FeishuBrainBridge._reply_for_text = lambda self, text, sender, message_id=None: BridgeReply("processed", "synthetic")
             try:
-                bridge = FeishuBrainBridge(brain, client, options())
+                bridge = self.make_bridge(brain, client)
                 bridge._jobs.join()
             finally:
                 FeishuBrainBridge._reply_for_text = original
@@ -284,7 +289,7 @@ class ReliabilityTests(unittest.TestCase):
             brain = PersonalBrain(config_for(Path(td)))
             brain.init_db()
             client = FakeClient()
-            bridge = FeishuBrainBridge(brain, client, options())
+            bridge = self.make_bridge(brain, client)
             calls = 0
             lock = threading.Lock()
 
@@ -312,7 +317,7 @@ class ReliabilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             brain = PersonalBrain(config_for(Path(td)))
             brain.init_db()
-            bridge = FeishuBrainBridge(brain, FakeClient(), options())
+            bridge = self.make_bridge(brain, FakeClient())
             brain.claim_interaction = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("db unavailable"))
             result = bridge.handle_payload(payload("fail", "failure-event"))
             self.assertFalse(result["ok"])
@@ -347,4 +352,3 @@ class ReliabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
